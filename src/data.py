@@ -42,7 +42,7 @@ class Corpus(object):
                 if word not in self.word_id:
                     self.word_id[word] = len(self.vocabulary)
                     self.vocabulary.append(word)
-        file_tokens = torch.LongTensor(num_of_words)
+        file_tokens = torch.LongTensor(num_of_words).cuda()
         
         token_id = 0
         for line in file_lines:
