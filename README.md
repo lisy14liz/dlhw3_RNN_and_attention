@@ -1,3 +1,4 @@
+# dlhw3_RNN_and_attention
 We provide the start code for this homework.
 You need to modify ``model.py`` and ``main.py`` to construct and train your model.
 For ``model.py``, we have provided the definition of encoder and decoder. You need to add your RNN model codes.
