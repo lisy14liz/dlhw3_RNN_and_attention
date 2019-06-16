@@ -4,13 +4,13 @@ import time
 import math
 import torch
 import torch.nn as nn
-
+import numpy as np
 import data
 import model
 import os
 import os.path as osp
 from loss import Perplexity
-
+from yellowfin import YFOptimizer
 parser = argparse.ArgumentParser(description='PyTorch ptb Language Model')
 parser.add_argument('--epochs', type=int, default=40,
                     help='upper epoch limit')
@@ -26,8 +26,12 @@ parser.add_argument('--seed', type=int, default=1234,
                     help='set random seed')
 parser.add_argument('--cuda', action='store_true', help='use CUDA device')
 parser.add_argument('--gpu_id', type=int, help='GPU device id used')
-parser.add_argument('--save', type=str, default='model_{}.pt'.format(time.strftime('%Y%m%d-%H-%M-%S')),
+parser.add_argument('--save', type=str, default='../model/model_{}.pt'.format(time.strftime('%Y%m%d-%H-%M-%S')),
                     help='path to save the final model')
+parser.add_argument('--opt_method', type=str, default='Adam',
+                    help='select the optimizer you are using')
+parser.add_argument('--lr', type=float, default=20,
+                    help='initial learning rate')
 args = parser.parse_args()
 
 # Set the random seed manually for reproducibility.
@@ -44,7 +48,7 @@ else:
 
     
 tie_weights = args.tied
-lr=20
+lr=args.lr
 # load data
 train_batch_size = args.train_batch_size
 eval_batch_size = args.eval_batch_size
@@ -55,7 +59,7 @@ data_loader = data.Corpus("../data/ptb", batch_size, args.max_sql)
 ########################################
 # Build LMModel model (bulid your language model here)\
 ntokens = len(data_loader.word_id)
-model=model.LMModel(nvoc=len(data_loader.word_id),ninput=300, nhid=32, nlayers=1, tie_weights).to(device)
+model=model.LMModel(nvoc=len(data_loader.word_id),ninput=300, nhid=300, nlayers=2,tie_weights=tie_weights).to(device)
 
 ########################################
 
@@ -93,7 +97,23 @@ def repackage_hidden(h):
     else:
         return tuple(repackage_hidden(v) for v in h)
 
-def train():
+def train(opt, loss_list,\
+    local_curv_list,\
+    max_curv_list,\
+    min_curv_list,\
+    lr_list,\
+    lr_t_list,\
+    mu_t_list,\
+    dr_list,\
+    mu_list,\
+    dist_list,\
+    grad_var_list,\
+    lr_g_norm_list,\
+    lr_g_norm_squared_list,\
+    move_lr_g_norm_list,\
+    move_lr_g_norm_squared_list,\
+    lr_grad_norm_clamp_act_list,\
+    fast_view_act_list):
     # Turn on training mode which enables dropout.
     data_loader.set_train()
     model.train()
@@ -103,6 +123,7 @@ def train():
     ntokens = len(data_loader.word_id)
     hidden = model.init_hidden(train_batch_size)
     end_flag = False
+    train_loss_list = []
     while not end_flag:
         data, targets, end_flag= data_loader.get_batch()
         #data, targets = get_batch(train_data, i)
@@ -116,8 +137,32 @@ def train():
 
         # `clip_grad_norm` helps prevent the exploding gradient problem in RNNs / LSTMs.
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.25)
-        for p in model.parameters():
-            p.data.add_(-lr, p.grad.data)
+        
+        optimizer.step()
+        loss_list.append(loss.data.item())
+        if args.opt_method == 'YF':        
+            local_curv_list.append(opt._global_state['grad_norm_squared'] )
+            max_curv_list.append(opt._h_max)
+            min_curv_list.append(opt._h_min)
+            lr_list.append(opt._lr)
+            mu_list.append(opt._mu)
+            dr_list.append((opt._h_max + 1e-6) / (opt._h_min + 1e-6))
+            dist_list.append(opt._dist_to_opt)
+            grad_var_list.append(opt._grad_var)
+
+            lr_g_norm_list.append(opt._lr * np.sqrt(opt._global_state['grad_norm_squared'].cpu() ) )
+            lr_g_norm_squared_list.append(opt._lr * opt._global_state['grad_norm_squared'] )
+            move_lr_g_norm_list.append(opt._optimizer.param_groups[0]["lr"] * np.sqrt(opt._global_state['grad_norm_squared'].cpu() ) )
+            move_lr_g_norm_squared_list.append(opt._optimizer.param_groups[0]["lr"] * opt._global_state['grad_norm_squared'] )
+
+            lr_t_list.append(opt._lr_t)
+            mu_t_list.append(opt._mu_t)
+
+
+        #total_loss += loss.data
+        train_loss_list.append(loss.data.item() )
+        #for p in model.parameters():
+            #p.data.add_(-lr, p.grad.data)
 
         total_loss += loss.item()
         log_interval=200
@@ -132,14 +177,107 @@ def train():
                 elapsed * 1000 / log_interval, cur_loss, math.exp(cur_loss)))
             total_loss = 0
             start_time = time.time()
+    return train_loss_list,\
+    loss_list,\
+    local_curv_list,\
+    max_curv_list,\
+    min_curv_list,\
+    lr_list,\
+    lr_t_list,\
+    mu_t_list,\
+    dr_list,\
+    mu_list,\
+    dist_list,\
+    grad_var_list,\
+    lr_g_norm_list,\
+    lr_g_norm_squared_list,\
+    move_lr_g_norm_list,\
+    move_lr_g_norm_squared_list,\
+    lr_grad_norm_clamp_act_list,\
+    fast_view_act_list
+
+
+if args.opt_method == "SGD":
+    optimizer = torch.optim.SGD(model.parameters(), lr, momentum=0.0)
+elif args.opt_method == "momSGD":
+    optimizer = torch.optim.SGD(model.parameters(), lr, momentum=0.9)
+elif args.opt_method == "YF":
+    optimizer = YFOptimizer(model.parameters() )
+elif args.opt_method == "Adam":
+    optimizer = torch.optim.Adam(model.parameters(), lr)
+
+
+best_val_loss = None
+train_loss_list = []
+val_loss_list = []
+lr_list = []
+mu_list = []
+
+loss_list = []
+local_curv_list = []
+max_curv_list = []
+min_curv_list = []
+lr_g_norm_list = []
+lr_list = []
+lr_t_list = []
+mu_t_list = []
+dr_list = []
+mu_list = []
+dist_list = []
+grad_var_list = []
+
+lr_g_norm_list = []
+lr_g_norm_squared_list = []
+
+move_lr_g_norm_list = []
+move_lr_g_norm_squared_list = []
+
+lr_grad_norm_clamp_act_list = []
+fast_view_act_list = []
 
 
 
-
-# Loop over epochs.
 for epoch in range(1, args.epochs+1):
     epoch_start_time = time.time()
-    train()
+    #train()
+    train_loss, \
+    loss_list, \
+    local_curv_list,\
+    max_curv_list,\
+    min_curv_list,\
+    lr_list,\
+    lr_t_list,\
+    mu_t_list,\
+    dr_list,\
+    mu_list,\
+    dist_list,\
+    grad_var_list,\
+    lr_g_norm_list,\
+    lr_g_norm_squared_list,\
+    move_lr_g_norm_list,\
+    move_lr_g_norm_squared_list,\
+    lr_grad_norm_clamp_act_list,\
+    fast_view_act_list = \
+      train(optimizer,
+      loss_list, \
+      local_curv_list,\
+      max_curv_list,\
+      min_curv_list,\
+      lr_list,\
+      lr_t_list,\
+      mu_t_list,\
+      dr_list,\
+      mu_list,\
+      dist_list,\
+      grad_var_list,\
+      lr_g_norm_list,\
+      lr_g_norm_squared_list,\
+      move_lr_g_norm_list,\
+      move_lr_g_norm_squared_list,\
+      lr_grad_norm_clamp_act_list,\
+      fast_view_act_list)
+
+    train_loss_list += train_loss
     val_loss = evaluate()
     print('-' * 89)
     print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
@@ -152,8 +290,21 @@ for epoch in range(1, args.epochs+1):
         with open(args.save, 'wb') as f:
             torch.save(model, f)
         best_val_loss = val_loss
-        lr /= 1.15
+        lr_decay=1.15
+        lr /=  lr_decay
+        if args.opt_method == "YF":
+            optimizer.set_lr_factor(optimizer.get_lr_factor() / lr_decay)
+        else:
+            for group in optimizer.param_groups:
+                group['lr'] /= lr_decay
     else:
         # Anneal the learning rate if no improvement has been seen in the validation dataset.
-        lr /= 3
+        #lr /= 3
+        lr_decay=4
+        lr /=  lr_decay
+        if args.opt_method == "YF":
+            optimizer.set_lr_factor(optimizer.get_lr_factor() / lr_decay)
+        else:
+            for group in optimizer.param_groups:
+                group['lr'] /= lr_decay
 
